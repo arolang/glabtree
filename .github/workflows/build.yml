@@ -58,6 +58,7 @@ jobs:
         if: runner.os == 'macOS'
         run: |
           brew tap arolang/aro
+          brew trust arolang/aro
           brew install aro libgit2 llvm@20
           aro --version
 
@@ -137,6 +138,7 @@ jobs:
       - name: Install ARO
         run: |
           brew tap arolang/aro
+          brew trust arolang/aro
           brew install aro libgit2 llvm@20
           echo "/opt/homebrew/opt/llvm@20/bin" >> $GITHUB_PATH
 
