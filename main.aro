@@ -1,0 +1,181 @@
+(*
+ * glabtree — Mirror a GitLab group's subgroup/repository tree onto the local
+ * filesystem, cloning every repository over SSH with ARO's embedded git.
+ *
+ * Usage:
+ *   GITLAB_TOKEN=glpat-xxxx aro run ./glabtree --group 1234 --url https://gitlab.com
+ *
+ *   --group <id>   Numeric GitLab group id to mirror (required)
+ *   --url <url>    GitLab base URL. Falls back to $GITLAB_URL, then prompts.
+ *   $GITLAB_TOKEN  Access token. If unset, the tool prompts for it (hidden).
+ *
+ * Architecture (event-driven + parallel + reactive):
+ *   - Discovery walks the group tree and STORES each project into
+ *     <repo-repository> with status "found". Projects on a page are stored with
+ *     `parallel for each` for concurrency.
+ *   - A guarded repository observer (sources/observers.aro) reacts to each
+ *     "found" record and performs the checkout (git clone over SSH), then
+ *     upserts the record as "cloned".
+ *   - A second repository observer re-renders a live square grid on every
+ *     change: ◻︎ for a discovered repo, ◼︎ once it is cloned.
+ *   - Typed objects (GitlabGroup, RepoRecord, RepoEvent, GroupEvent) are
+ *     declared as OpenAPI components and pulled in one validated step.
+ *
+ * Layout note: user-defined actions resolve only within the file that declares
+ * Application-Start, so all actions live here. Observers and event handlers are
+ * routed through the EventBus and live under sources/.
+ *)
+
+(* ============================================================
+ * Configuration resolution: parameter > environment > prompt
+ * ============================================================ *)
+
+(GitlabHost: Action) {
+    Extract the <params> from the <parameter>.
+    Return an <OK: status> with { value: <params: url> } when <params> contains "url".
+
+    Extract the <env-url> from the <env: GITLAB_URL>.
+    Return an <OK: status> with { value: <env-url> } when <env-url> != "".
+
+    Prompt the <typed-url> from the <terminal> with "GitLab base URL (e.g. https://gitlab.com): ".
+    Return an <OK: status> with { value: <typed-url> }.
+}
+
+(GitlabToken: Action) {
+    Extract the <env-token> from the <env: GITLAB_TOKEN>.
+    Return an <OK: status> with { value: <env-token> } when <env-token> != "".
+
+    Prompt the <typed-token: hidden> from the <terminal> with "GitLab token (GITLAB_TOKEN not set): ".
+    Return an <OK: status> with { value: <typed-token> }.
+}
+
+(* ============================================================
+ * Recursive traversal of the group tree
+ * ============================================================ *)
+
+(MirrorGroup: Action) {
+    (* groupPath feeds a <path: ...> qualifier, so bind it plainly. *)
+    Extract the <group-path> from the <input: groupPath>.
+
+    (* The group directory must exist even when it holds no repositories, and
+       it must precede any clone into it (embedded git will not create it). *)
+    Make the <group-dir> to the <path: group-path>.
+    Emit a <GroupDiscovered: event> with { path: <group-path> }.
+
+    (* Direct repositories first, then nested subgroups (both paginated). *)
+    Application.CloneProjectsPage the <projects-done> with {
+        apiBase: <input: apiBase>, token: <input: token>, groupId: <input: groupId>, page: 1
+    }.
+    Application.MirrorSubgroupsPage the <subgroups-done> with {
+        apiBase: <input: apiBase>, token: <input: token>, groupId: <input: groupId>, page: 1
+    }.
+
+    Return an <OK: status> with { path: <group-path> }.
+}
+
+(CloneProjectsPage: Action) {
+    Create the <url> with "${<input: apiBase>}/groups/${<input: groupId>}/projects?per_page=100&page=${<input: page>}&include_subgroups=false&archived=false&order_by=path&sort=asc".
+    Request the <api-response> from the <url> with {
+        method: "GET",
+        headers: { "PRIVATE-TOKEN": "${<input: token>}", "Accept": "application/json" }
+    }.
+    Extract the <projects> from the <api-response: body>.
+
+    (* Store each project concurrently; each store fires the checkout + render
+       observers. status "found" renders as ◻︎ until the clone completes. *)
+    parallel for each <project> in <projects> with <concurrency: 8> {
+        Create the <record> with {
+            id: <project: path_with_namespace>,
+            name: <project: name>,
+            dest: <project: path_with_namespace>,
+            ssh: <project: ssh_url_to_repo>,
+            status: "found",
+            marker: "◻︎"
+        }.
+        Store the <record> into the <repo-repository>.
+    }
+
+    (* Follow pagination via the x-next-page header (empty on the last page). *)
+    Extract the <headers> from the <api-response: headers>.
+    Application.CloneProjectsPage the <more> with {
+        apiBase: <input: apiBase>, token: <input: token>, groupId: <input: groupId>, page: <headers: x-next-page>
+    } when <headers: x-next-page> != "".
+
+    Return an <OK: status> with { page: <input: page> }.
+}
+
+(MirrorSubgroupsPage: Action) {
+    Create the <url> with "${<input: apiBase>}/groups/${<input: groupId>}/subgroups?per_page=100&page=${<input: page>}&order_by=path&sort=asc".
+    Request the <api-response> from the <url> with {
+        method: "GET",
+        headers: { "PRIVATE-TOKEN": "${<input: token>}", "Accept": "application/json" }
+    }.
+    Extract the <subgroups> from the <api-response: body>.
+
+    for each <subgroup> in <subgroups> {
+        Application.MirrorGroup the <mirrored> with {
+            apiBase: <input: apiBase>, token: <input: token>,
+            groupId: <subgroup: id>, groupPath: <subgroup: full_path>
+        }.
+    }
+
+    Extract the <headers> from the <api-response: headers>.
+    Application.MirrorSubgroupsPage the <more> with {
+        apiBase: <input: apiBase>, token: <input: token>, groupId: <input: groupId>, page: <headers: x-next-page>
+    } when <headers: x-next-page> != "".
+
+    Return an <OK: status> with { page: <input: page> }.
+}
+
+(* ============================================================
+ * Entry point
+ * ============================================================ *)
+
+(Application-Start: GLab Tree) {
+    (* Resolve configuration first — prompts need a visible terminal. *)
+    Application.GitlabHost the <host-result> with { }.
+    Application.GitlabToken the <token-result> with { }.
+    Extract the <group> from the <parameter: group>.
+    Create the <api-base> with "${<host-result: value>}/api/v4".
+
+    (* Start an audit trail (custom events append to this file). *)
+    Create the <audit-path> with "glabtree-audit.log".
+    Create the <audit-header> with "glabtree run started\n".
+    Write the <audit-header> to the <file: audit-path>.
+
+    (* Take over the screen for the live grid. *)
+    Clear the <screen> for the <terminal>.
+    Clear the <cursor> for the <terminal>.
+
+    (* Learn the root group's full path (typed API response). *)
+    Create the <group-url> with "${<api-base>}/groups/${<group>}".
+    Request the <group-response> from the <group-url> with {
+        method: "GET",
+        headers: { "PRIVATE-TOKEN": "${<token-result: value>}", "Accept": "application/json" }
+    }.
+    Extract the <group-info: GitlabGroup> from the <group-response: body>.
+
+    (* Recursively mirror; stores drive the checkout + render observers. *)
+    Application.MirrorGroup the <done> with {
+        apiBase: <api-base>, token: <token-result: value>,
+        groupId: <group>, groupPath: <group-info: full_path>
+    }.
+
+    Show the <cursor> for the <terminal>.
+    Return an <OK: status> for the <startup>.
+}
+
+(Application-End: Success) {
+    Show the <cursor> for the <terminal>.
+    Return an <OK: status> for the <shutdown>.
+}
+
+(* Audit each group. Co-located with the GroupDiscovered emit (MirrorGroup)
+   so the analyzer sees the handler. Appends to the audit file. *)
+(Record Group: GroupDiscovered Handler) {
+    Extract the <e: GroupEvent> from the <event>.
+    Create the <audit-path> with "glabtree-audit.log".
+    Create the <line> with "group ${<e: path>}\n".
+    Append the <written> to the <file: audit-path> with <line>.
+    Return an <OK: status> for the <audit>.
+}

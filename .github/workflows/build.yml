@@ -1,0 +1,319 @@
+name: Build & Release
+
+on:
+  push:
+    branches: [main]
+    tags: ['*']
+  pull_request:
+    branches: [main]
+
+env:
+  ARO_VERSION: latest
+  SWIFT_VERSION: '6.2.1'
+
+jobs:
+  # ===========================================================================
+  # Check — syntax-check on both platforms
+  # ===========================================================================
+  check:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            asset: aro-linux-amd64.tar.gz
+          - os: macos-latest
+            asset: aro-macos-arm64.tar.gz
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libgit2-dev
+          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo gpg --dearmor -o /usr/share/keyrings/llvm-archive-keyring.gpg
+          echo "deb [signed-by=/usr/share/keyrings/llvm-archive-keyring.gpg] http://apt.llvm.org/jammy/ llvm-toolchain-jammy-20 main" | sudo tee /etc/apt/sources.list.d/llvm.list
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libllvm20
+
+      - name: Install ARO (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          if [ "$ARO_VERSION" = "latest" ]; then
+            DOWNLOAD_URL=$(curl -s https://api.github.com/repos/arolang/aro/releases/latest \
+              | grep "browser_download_url.*${{ matrix.asset }}" \
+              | cut -d '"' -f 4)
+          else
+            DOWNLOAD_URL="https://github.com/arolang/aro/releases/download/${ARO_VERSION}/${{ matrix.asset }}"
+          fi
+          curl -fsSL "$DOWNLOAD_URL" | tar xz
+          sudo mv aro /usr/local/bin/
+          sudo mv libARORuntime.a /usr/local/lib/
+          aro --version
+
+      - name: Install ARO (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew tap arolang/aro
+          brew install aro libgit2 llvm@20
+          aro --version
+
+      - name: Check code
+        run: aro check .
+
+  # ===========================================================================
+  # Build — compile for macOS (signed) and Linux
+  # ===========================================================================
+  build-linux:
+    needs: check
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Swift
+        run: |
+          curl -fsSL "https://download.swift.org/swift-${SWIFT_VERSION}-release/ubuntu2204/swift-${SWIFT_VERSION}-RELEASE/swift-${SWIFT_VERSION}-RELEASE-ubuntu22.04.tar.gz" -o swift.tar.gz
+          sudo mkdir -p /usr/share/swift
+          sudo tar xzf swift.tar.gz -C /usr/share/swift --strip-components=1
+          echo "/usr/share/swift/usr/bin" >> $GITHUB_PATH
+          rm swift.tar.gz
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libgit2-dev
+          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo gpg --dearmor -o /usr/share/keyrings/llvm-archive-keyring.gpg
+          echo "deb [signed-by=/usr/share/keyrings/llvm-archive-keyring.gpg] http://apt.llvm.org/jammy/ llvm-toolchain-jammy-20 main" | sudo tee /etc/apt/sources.list.d/llvm.list
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq llvm-20
+          sudo ln -sf /usr/lib/llvm-20/bin/llc /usr/local/bin/llc
+          sudo ln -sf /usr/lib/llvm-20/bin/clang /usr/local/bin/clang
+
+      - name: Install ARO
+        run: |
+          if [ "$ARO_VERSION" = "latest" ]; then
+            DOWNLOAD_URL=$(curl -s https://api.github.com/repos/arolang/aro/releases/latest \
+              | grep "browser_download_url.*aro-linux-amd64.tar.gz" \
+              | cut -d '"' -f 4)
+          else
+            DOWNLOAD_URL="https://github.com/arolang/aro/releases/download/${ARO_VERSION}/aro-linux-amd64.tar.gz"
+          fi
+          curl -fsSL "$DOWNLOAD_URL" | tar xz
+          sudo mv aro /usr/local/bin/
+          sudo mv libARORuntime.a /usr/local/lib/
+
+      - name: Build
+        run: aro build . --optimize --strip --size -o glabtree
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: glabtree-linux-amd64
+          path: glabtree
+
+  build-macos:
+    needs: check
+    runs-on: macos-latest
+    env:
+      APPLE_CERTIFICATE_BASE64: ${{ secrets.APPLE_CERTIFICATE_BASE64 }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      APPLE_ID: ${{ secrets.APPLE_ID }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Swift
+        run: |
+          curl -fsSL "https://download.swift.org/swift-${SWIFT_VERSION}-release/xcode/swift-${SWIFT_VERSION}-RELEASE/swift-${SWIFT_VERSION}-RELEASE-osx.pkg" -o swift.pkg
+          sudo installer -pkg swift.pkg -target /
+          TOOLCHAIN_BIN="/Library/Developer/Toolchains/swift-${SWIFT_VERSION}-RELEASE.xctoolchain/usr/bin"
+          echo "$TOOLCHAIN_BIN" >> $GITHUB_PATH
+          rm swift.pkg
+
+      - name: Install ARO
+        run: |
+          brew tap arolang/aro
+          brew install aro libgit2 llvm@20
+          echo "/opt/homebrew/opt/llvm@20/bin" >> $GITHUB_PATH
+
+      - name: Import Code Signing Certificate
+        if: github.ref_type == 'tag' && env.APPLE_CERTIFICATE_BASE64 != ''
+        env:
+          APPLE_CERTIFICATE_BASE64: ${{ secrets.APPLE_CERTIFICATE_BASE64 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          KEYCHAIN_PATH=$RUNNER_TEMP/app-signing.keychain-db
+          KEYCHAIN_PASSWORD=$(openssl rand -base64 32)
+
+          echo "$APPLE_CERTIFICATE_BASE64" | base64 --decode > certificate.p12
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
+          security set-keychain-settings -lut 21600 $KEYCHAIN_PATH
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
+
+          security import certificate.p12 \
+            -P "$APPLE_CERTIFICATE_PASSWORD" \
+            -A \
+            -t cert \
+            -f pkcs12 \
+            -k $KEYCHAIN_PATH
+
+          security list-keychain -d user -s $KEYCHAIN_PATH
+          security set-key-partition-list \
+            -S apple-tool:,apple: \
+            -s \
+            -k "$KEYCHAIN_PASSWORD" \
+            $KEYCHAIN_PATH
+
+          rm certificate.p12
+
+      - name: Build (signed)
+        if: github.ref_type == 'tag' && env.APPLE_TEAM_ID != ''
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          aro build . --sign "$APPLE_TEAM_ID" --optimize --strip --size -o glabtree
+          codesign --verify --verbose glabtree
+
+      - name: Build (unsigned)
+        if: github.ref_type != 'tag' || env.APPLE_TEAM_ID == ''
+        run: aro build . --optimize --strip --size -o glabtree
+
+      - name: Notarize Binary
+        if: github.ref_type == 'tag' && env.APPLE_ID != ''
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+        run: |
+          zip -r glabtree.zip glabtree
+          xcrun notarytool submit glabtree.zip \
+            --apple-id "$APPLE_ID" \
+            --team-id "$APPLE_TEAM_ID" \
+            --password "$APPLE_APP_PASSWORD" \
+            --wait
+          # Staple may fail for CLI tools — that's OK
+          xcrun stapler staple glabtree || true
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: glabtree-macos-arm64
+          path: glabtree
+
+  # ===========================================================================
+  # Release — create GitHub release on tag push
+  # ===========================================================================
+  release:
+    name: Create Release
+    needs: [build-linux, build-macos]
+    runs-on: ubuntu-latest
+    if: github.ref_type == 'tag'
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Package release assets
+        run: |
+          cd artifacts/glabtree-linux-amd64
+          chmod +x glabtree
+          tar -czvf ../glabtree-linux-amd64.tar.gz glabtree
+          cd ../..
+
+          cd artifacts/glabtree-macos-arm64
+          chmod +x glabtree
+          tar -czvf ../glabtree-macos-arm64.tar.gz glabtree
+          cd ../..
+
+      - name: Extract version from tag
+        id: version
+        run: |
+          VERSION="${{ github.ref_name }}"
+          VERSION="${VERSION#v}"
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: glabtree ${{ steps.version.outputs.version }}
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          generate_release_notes: true
+          files: |
+            artifacts/glabtree-linux-amd64.tar.gz
+            artifacts/glabtree-macos-arm64.tar.gz
+          body: |
+            ## glabtree ${{ steps.version.outputs.version }}
+
+            Mirror a GitLab group's entire subgroup/repository tree onto the local
+            filesystem and clone every repository over SSH — written in ARO.
+
+            ### Downloads
+
+            | Platform | Architecture | Download |
+            |----------|--------------|----------|
+            | macOS | Apple Silicon | [glabtree-macos-arm64.tar.gz](https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/glabtree-macos-arm64.tar.gz) |
+            | Linux | x86_64 | [glabtree-linux-amd64.tar.gz](https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/glabtree-linux-amd64.tar.gz) |
+
+            ### Installation
+
+            **macOS (Homebrew)**
+            ```bash
+            brew tap arolang/applications
+            brew install arolang/applications/glabtree
+            ```
+
+            **macOS (Manual)**
+            ```bash
+            curl -fsSL https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/glabtree-macos-arm64.tar.gz | tar xz
+            sudo mv glabtree /usr/local/bin/
+            ```
+
+            **Linux**
+            ```bash
+            curl -fsSL https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/glabtree-linux-amd64.tar.gz | tar xz
+            sudo mv glabtree /usr/local/bin/
+            ```
+
+      # ======================================================================
+      # Trigger Homebrew Formula Update
+      # ======================================================================
+      - name: Trigger Homebrew Formula Update
+        continue-on-error: true
+        env:
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          SHA256_MACOS=$(shasum -a 256 artifacts/glabtree-macos-arm64.tar.gz | awk '{print $1}')
+          SHA256_LINUX=$(shasum -a 256 artifacts/glabtree-linux-amd64.tar.gz | awk '{print $1}')
+          VERSION="${{ steps.version.outputs.version }}"
+
+          echo "Triggering homebrew formula update for glabtree ${VERSION}"
+          echo "SHA256 macOS: $SHA256_MACOS"
+          echo "SHA256 Linux: $SHA256_LINUX"
+
+          curl -fsSL -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${HOMEBREW_TAP_TOKEN}" \
+            https://api.github.com/repos/arolang/homebrew-applications/dispatches \
+            -d "{
+              \"event_type\": \"update-formula\",
+              \"client_payload\": {
+                \"formula\": \"glabtree\",
+                \"version\": \"${VERSION}\",
+                \"tag\": \"${{ github.ref_name }}\",
+                \"repo\": \"${{ github.repository }}\",
+                \"sha256_macos\": \"${SHA256_MACOS}\",
+                \"sha256_linux\": \"${SHA256_LINUX}\"
+              }
+            }"

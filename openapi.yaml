@@ -1,0 +1,81 @@
+openapi: 3.0.3
+info:
+  title: glabtree
+  description: |
+    Typed object definitions for the glabtree GitLab group-mirroring tool.
+
+    glabtree is a one-shot CLI (`aro run ./glabtree --group <id>`); it does not
+    run an HTTP server. This document exists only to declare the OpenAPI
+    component schemas that the ARO code extracts as validated typed objects
+    (via `Extract the <x: SchemaName> from ...`). The `paths` object is
+    intentionally empty.
+  version: 1.0.0
+
+paths: {}
+
+components:
+  schemas:
+    GitlabGroup:
+      type: object
+      description: The subset of a GitLab group object that glabtree consumes
+      properties:
+        id:
+          type: integer
+          description: Numeric group id
+        name:
+          type: string
+        full_path:
+          type: string
+          description: Full path of the group (e.g. acme/platform/backend)
+      required:
+        - id
+        - full_path
+
+    RepoRecord:
+      type: object
+      description: A repository record stored in repo-repository
+      properties:
+        id:
+          type: string
+          description: Stable key — the repository's path_with_namespace
+        name:
+          type: string
+        dest:
+          type: string
+          description: Local destination path (mirrors path_with_namespace)
+        ssh:
+          type: string
+          description: SSH clone URL (ssh_url_to_repo)
+        status:
+          type: string
+          description: found | cloned
+        marker:
+          type: string
+          description: Grid glyph — ◻︎ (found) or ◼︎ (cloned)
+      required:
+        - id
+        - dest
+        - ssh
+
+    GroupEvent:
+      type: object
+      description: Payload of the GroupDiscovered event
+      properties:
+        path:
+          type: string
+          description: Full path of the discovered group
+      required:
+        - path
+
+    RepoEvent:
+      type: object
+      description: Payload of the RepositoryCloned event
+      properties:
+        name:
+          type: string
+        path:
+          type: string
+          description: Local destination path of the repository
+      required:
+        - name
+        - path

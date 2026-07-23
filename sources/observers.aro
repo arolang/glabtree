@@ -1,0 +1,59 @@
+(*
+ * observers.aro — Repository observers (ARO-0007), the reactive core.
+ *
+ * Storing a project into <repo-repository> fires both observers below:
+ *   - Checkout Found Repo: a state-guarded observer that reacts only to newly
+ *     "found" records, clones the repository over SSH with ARO's embedded git
+ *     (ARO-0080), then upserts the record as "cloned". Because it is guarded on
+ *     status:found, its own "cloned" upsert does not retrigger it.
+ *   - Render Grid: reacts to every change and repaints the live square grid in
+ *     place (◻︎ found, ◼︎ cloned).
+ *)
+
+(Checkout Found Repo: repo-repository Observer<status:found>) {
+    (* Pull the stored project as one validated typed object. *)
+    Extract the <project: RepoRecord> from the <event: newValue>.
+
+    (* Clone over SSH. On failure the runtime records an error event and the
+       record stays "found" (◻︎); the sweep continues. *)
+    Clone the <cloned> from the <git> with { url: <project: ssh>, path: <project: dest> }.
+
+    Emit a <RepositoryCloned: event> with { name: <project: name>, path: <project: dest>, commit: <cloned: short> }.
+
+    (* Flip the record to cloned → ◼︎ (fires Render Grid, not this observer). *)
+    Create the <done> with {
+        id: <project: id>,
+        name: <project: name>,
+        dest: <project: dest>,
+        ssh: <project: ssh>,
+        status: "cloned",
+        marker: "◼︎"
+    }.
+    Store the <done> into the <repo-repository>.
+
+    Return an <OK: status> for the <checkout>.
+}
+
+(* Audit each clone. Co-located with the emit above so the analyzer sees the
+   handler for RepositoryCloned. Appends to the audit file, not the console. *)
+(Record Clone: RepositoryCloned Handler) {
+    Extract the <e: RepoEvent> from the <event>.
+    Create the <audit-path> with "glabtree-audit.log".
+    Create the <line> with "cloned ${<e: path>}\n".
+    Append the <written> to the <file: audit-path> with <line>.
+    Return an <OK: status> for the <audit>.
+}
+
+(Render Grid: repo-repository Observer) {
+    Retrieve the <cells> from the <repo-repository>.
+    Compute the <total: length> from <cells>.
+    Filter the <cloned-list> from the <cells> where <status> is "cloned".
+    Compute the <cloned: length> from <cloned-list>.
+
+    Create the <cols> with 16.
+    Compute the <colmax> from <cols> - 1.
+
+    Transform the <grid> from the <template: grid.screen>.
+    Render the <grid> to the <console>.
+    Return an <OK: status> for the <refresh>.
+}

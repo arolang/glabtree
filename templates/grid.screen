@@ -1,0 +1,7 @@
+  glabtree · mirroring GitLab group tree
+
+  {{ <cloned> }} / {{ <total> }} repositories cloned
+
+  {{ for each <cell> at <i> in <cells> { }}{{ <cell: marker> }} {{ Print "\n  " to the <template> when <i> % <cols> == <colmax>. }}{{ } }}
+
+  ◻︎ found   ◼︎ cloned

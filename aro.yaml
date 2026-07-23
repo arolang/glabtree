@@ -1,0 +1,15 @@
+# glabtree — ARO application manifest
+#
+# Mirrors a GitLab group's subgroup/repository tree onto the local filesystem
+# and clones every repository over SSH using ARO's embedded git.
+
+name: glabtree
+version: 1.0.0
+description: Mirror a GitLab group's subgroup and repository tree locally.
+author: Kris
+license: MIT
+aro-version: ">=0.11.2"
+
+# No external plugins are required; glabtree uses only built-in actions
+# (Request, Make, Exists, Clone, Emit, Store) plus user-defined actions.
+plugins: []
