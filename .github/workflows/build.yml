@@ -8,8 +8,8 @@ on:
     branches: [main]
 
 env:
-  ARO_VERSION: latest
-  SWIFT_VERSION: '6.2.1'
+  ARO_VERSION: '0.11.2'
+  SWIFT_VERSION: '6.3.2'   # must match the toolchain arolang/aro builds libARORuntime.a with
 
 jobs:
   # ===========================================================================
